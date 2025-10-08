@@ -14,13 +14,42 @@ import csv
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
-import PyPDF2
-import google.generativeai as genai
 import argparse
-from dotenv import load_dotenv
-import pandas as pd
 from difflib import SequenceMatcher
 import unicodedata
+import importlib
+import importlib.util
+
+
+def _optional_import(module_name: str):
+    """Attempt to import an optional dependency without raising errors."""
+    base_name = module_name.split('.')[0]
+    if importlib.util.find_spec(base_name) is None:
+        return None
+
+    spec = importlib.util.find_spec(module_name)
+    if spec is None:
+        return None
+
+    return importlib.import_module(module_name)
+
+
+PyPDF2 = _optional_import("PyPDF2")
+genai = _optional_import("google.generativeai")
+pd = _optional_import("pandas")
+dotenv_module = _optional_import("dotenv")
+openpyxl_module = _optional_import("openpyxl")
+
+if openpyxl_module is not None:
+    from openpyxl import Workbook, load_workbook
+else:
+    Workbook = load_workbook = None
+
+if dotenv_module is not None:
+    load_dotenv = getattr(dotenv_module, "load_dotenv", lambda *args, **kwargs: None)
+else:
+    def load_dotenv(*args, **kwargs):
+        return None
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +57,77 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+DEFAULT_SUIVI_PATH = Path(r"C:\Users\HugoCHASTENET\JICAP\Drive - 10.RUBO\MCDONALD'S_ Gestion Déléguée\03_RUN\Facturation\Facturation ALL\SUIVI DES FACTURES.xlsx")
+EXCEL_HEADERS = ["Site", "Prestataire", "Numéro de facture", "Date d'insertion"]
+SUIVI_SHEET_NAME = "FACTURES RENOMMEES"
+
+
+def _first_non_empty(*values) -> Optional[str]:
+    """Return the first non-empty value converted to a trimmed string."""
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            candidate = value.strip()
+        else:
+            candidate = str(value).strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def append_invoice_to_excel(file_path, site, prestataire, invoice_number):
+    """Ajoute une ligne dans Suivi_factures.xlsx avec les informations extraites de Gemini.
+    Crée le fichier s'il n'existe pas et évite les doublons (Site, Numéro de facture).
+    """
+    if openpyxl_module is None or Workbook is None or load_workbook is None:
+        raise ImportError("openpyxl is required to write the suivi Excel file.")
+
+    suivi_path = Path(file_path)
+    if suivi_path.suffix == "":
+        suivi_path = suivi_path.with_suffix(".xlsx")
+
+    if not suivi_path.parent.exists():
+        suivi_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if suivi_path.exists():
+        workbook = load_workbook(suivi_path)
+        if SUIVI_SHEET_NAME in workbook.sheetnames:
+            worksheet = workbook[SUIVI_SHEET_NAME]
+        else:
+            worksheet = workbook.create_sheet(SUIVI_SHEET_NAME)
+            if worksheet.max_row == 1 and all(cell.value is None for cell in worksheet[1]):
+                worksheet.append(EXCEL_HEADERS)
+    else:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = SUIVI_SHEET_NAME
+        worksheet.append(EXCEL_HEADERS)
+
+    # Prepare deduplication keys
+    normalized_site = (site or "").strip().casefold()
+    normalized_invoice = (invoice_number or "").strip().casefold()
+
+    if normalized_site or normalized_invoice:
+        for row in worksheet.iter_rows(min_row=2, values_only=True):
+            existing_site = (row[0] or "").strip().casefold()
+            existing_invoice = (row[2] or "").strip().casefold()
+            if existing_site == normalized_site and existing_invoice == normalized_invoice:
+                workbook.save(suivi_path)
+                return False
+
+    date_insertion = datetime.now().strftime("%d/%m/%Y")
+
+    worksheet.append([
+        site or "",
+        prestataire or "",
+        invoice_number or "",
+        date_insertion,
+    ])
+
+    workbook.save(suivi_path)
+    return True
 
 class ProcessingLogger:
     """Enhanced logger for PDF processing with structured output and detailed reporting."""
@@ -436,28 +536,42 @@ class PersistentRateLimiter:
 RateLimiter = PersistentRateLimiter
 
 class PDFRenamer:
-    def __init__(self, api_key: str = None, csv_dir: str = ".", enable_detailed_logging: bool = True):
+    def __init__(self, api_key: str = None, csv_dir: str = ".", enable_detailed_logging: bool = True,
+                 offline_mode: bool = False):
         """Initialize the PDF renamer with API key and CSV directory."""
         # Get API key from parameter or environment
         if not api_key:
             api_key = os.getenv('GEMINI_API_KEY')
-        
-        if not api_key or api_key == 'your_api_key_here':
-            raise ValueError("Please set your Gemini API key in the .env file or pass it as a parameter")
-        
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
+
+        self.offline_mode = offline_mode or genai is None
+
+        if self.offline_mode:
+            if genai is None and not offline_mode:
+                logger.warning(
+                    "google-generativeai package is not installed. Running in offline mode without AI analysis.")
+            if not api_key or api_key == 'your_api_key_here':
+                logger.info("No Gemini API key provided; continuing in offline mode.")
+            self.model = None
+        else:
+            if not api_key or api_key == 'your_api_key_here':
+                raise ValueError("Please set your Gemini API key in the .env file or pass it as a parameter")
+
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-2.5-flash')
         self.csv_dir = Path(csv_dir)
-        
+
         # Initialize enhanced logging
         self.processing_logger = ProcessingLogger(enable_file_logging=enable_detailed_logging)
-        
+
         # Initialize persistent rate limiter for Gemini 2.5 Flash
         max_per_minute = 1000
         max_per_day = 10000
         self.rate_limiter = PersistentRateLimiter(max_per_minute, max_per_day)
-        
-        logger.info(f"Rate limiter initialized: {max_per_minute}/minute, {max_per_day}/day (Gemini 2.5 Flash tier)")
+
+        if self.offline_mode:
+            logger.info("Rate limiter initialized in offline mode; API requests will be skipped.")
+        else:
+            logger.info(f"Rate limiter initialized: {max_per_minute}/minute, {max_per_day}/day (Gemini 2.5 Flash tier)")
         
         # Show current usage on startup
         status = self.rate_limiter.get_status()
@@ -480,6 +594,7 @@ class PDFRenamer:
         
         # Create lookup dictionaries for faster matching
         self.restaurant_lookup = self._create_restaurant_lookup()
+        self.suivi_excel_path = Path(os.getenv("SUIVI_EXCEL_PATH", str(DEFAULT_SUIVI_PATH)))
         
     def _normalize_text(self, text: str) -> str:
         """Normalize text by lowercasing, removing accents, and stripping extra whitespace."""
@@ -497,7 +612,17 @@ class PDFRenamer:
         """Load restaurant data from Excel file only."""
         restaurants = []
         excel_path = self.csv_dir / "Liste des clients.xlsx"
-        
+
+        if pd is None:
+            logger.warning("pandas is not available. Restaurant lookup data will be empty in offline mode.")
+            return restaurants
+
+        if not excel_path.exists():
+            if self.offline_mode:
+                logger.warning(f"Restaurant Excel file not found at {excel_path}. Offline mode will proceed without restaurant data.")
+                return restaurants
+            raise FileNotFoundError(f"Required Excel file not found: {excel_path}")
+
         try:
             # Load Excel file
             df = pd.read_excel(excel_path)
@@ -527,6 +652,9 @@ class PDFRenamer:
             
         except Exception as e:
             logger.error(f"Critical error loading Excel file {excel_path}: {e}")
+            if self.offline_mode:
+                logger.warning("Continuing without restaurant lookup data due to offline mode.")
+                return restaurants
             logger.error("Excel file is required - CSV fallback has been deprecated")
             raise RuntimeError(f"Could not load required Excel file: {excel_path}. Please ensure the file exists and is accessible.")
     
@@ -536,7 +664,14 @@ class PDFRenamer:
         """Load prestataires data from CSV file with automatic delimiter detection."""
         prestataires = {}
         csv_path = self.csv_dir / "Prestataires.csv"
-        
+
+        if not csv_path.exists():
+            message = f"Prestataires file not found at {csv_path}"
+            if self.offline_mode:
+                logger.warning(f"{message}. Offline mode will proceed without collector mappings.")
+                return prestataires
+            raise FileNotFoundError(message)
+
         # Auto-detect delimiter
         with open(csv_path, 'r', encoding='utf-8-sig') as file:
             first_line = file.readline()
@@ -573,7 +708,14 @@ class PDFRenamer:
         """Load valid collector names from Prestataires.csv for validation with automatic delimiter detection."""
         valid_collectors = set()
         csv_path = self.csv_dir / "Prestataires.csv"
-        
+
+        if not csv_path.exists():
+            message = f"Prestataires file not found at {csv_path}"
+            if self.offline_mode:
+                logger.warning(f"{message}. Offline mode will proceed without collector validation.")
+                return valid_collectors
+            raise FileNotFoundError(message)
+
         try:
             # Auto-detect delimiter
             with open(csv_path, 'r', encoding='utf-8-sig') as file:
@@ -780,6 +922,10 @@ class PDFRenamer:
     
     def _extract_pdf_text(self, pdf_path: Path) -> str:
         """Extract text from the first page of a PDF."""
+        if PyPDF2 is None:
+            logger.warning("PyPDF2 is not available. Unable to extract text from PDFs in offline mode.")
+            return ""
+
         try:
             with open(pdf_path, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
@@ -789,12 +935,108 @@ class PDFRenamer:
         except Exception as e:
             logger.error(f"Error extracting text from {pdf_path}: {e}")
             return ""
+
+    def _read_pdf_metadata(self, pdf_path: Path) -> Dict[str, str]:
+        """Read PDF metadata into a plain dictionary."""
+        if PyPDF2 is None:
+            return {}
+
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                info = reader.metadata or {}
+                metadata = {}
+                for key, value in info.items():
+                    if value is None:
+                        continue
+                    cleaned_key = str(key).lstrip('/')
+                    metadata[cleaned_key] = str(value)
+                return metadata
+        except Exception as e:
+            logger.debug(f"Unable to read metadata for {pdf_path}: {e}")
+            return {}
+
+    def _extract_site_from_filename(self, filename: str) -> Optional[str]:
+        """Try to extract the site number from a filename."""
+        if not filename:
+            return None
+
+        match = re.match(r'^\s*(\d{2,})', filename)
+        if match:
+            return match.group(1)
+
+        parts = filename.split('-')
+        if parts:
+            first = parts[0].strip()
+            if first.isdigit():
+                return first
+        return None
+
+    def _extract_prestataire_from_filename(self, filename: str) -> Optional[str]:
+        """Extract prestataire from filename using dash separation."""
+        if not filename:
+            return None
+
+        parts = filename.split('-')
+        if len(parts) >= 2:
+            candidate = parts[1].strip()
+            if candidate:
+                return candidate
+        return None
+
+    def _extract_invoice_number_from_filename(self, filename: str) -> Optional[str]:
+        """Extract invoice number from filename (usually the last segment)."""
+        if not filename:
+            return None
+
+        parts = filename.split('-')
+        if parts:
+            candidate = parts[-1].strip()
+            if candidate:
+                return candidate
+        return None
+
+    def _prepare_tracking_entry(self, extracted_data: Dict) -> Dict[str, Optional[str]]:
+        """Map Gemini analysis data to the fields required for Excel tracking."""
+        if not isinstance(extracted_data, dict):
+            extracted = {}
+        else:
+            extracted = dict(extracted_data)
+
+        raw_analysis = extracted.get('raw_analysis') if isinstance(extracted.get('raw_analysis'), dict) else {}
+
+        site = _first_non_empty(
+            extracted.get('site_number'),
+            raw_analysis.get('site_number')
+        )
+
+        prestataire = _first_non_empty(
+            extracted.get('collecte'),
+            extracted.get('invoice_provider'),
+            raw_analysis.get('collecte'),
+            raw_analysis.get('invoice_provider')
+        )
+
+        invoice_number = _first_non_empty(
+            extracted.get('invoice_number'),
+            raw_analysis.get('invoice_number')
+        )
+
+        return {
+            'site': site or '',
+            'prestataire': prestataire or '',
+            'invoice_number': invoice_number or '',
+        }
     
     def _analyze_invoice_with_gemini(self, pdf_path: Path, filename: str = "unknown") -> Dict:
         """Use Gemini to analyze invoice content and extract key information."""
+        if self.offline_mode or self.model is None:
+            logger.info(f"Offline mode: skipping Gemini analysis for {pdf_path.name}.")
+            return {}
+
         prompt = """
         Analyze this French invoice PDF and extract the following information in JSON format:
-        
+
         1. entreprise: The company name. Be very specific and extract the full name. For example, if the name is "McDonald's Chalon Sur Saone Bowling", extract the entire name, not just "McDonald's Chalon". Look for variations of McDonald's like "MAC DO", "McDONALD'S", etc.
         2. restaurant_address: The restaurant address if mentioned (street address, city, postal code)
         3. invoice_provider: The invoice provider/collector company (like SUEZ, VEOLIA, PAPREC, etc.)
@@ -1269,14 +1511,36 @@ class PDFRenamer:
         """Sanitize invoice number by removing accents and all non-alphanumeric characters."""
         if not invoice_number:
             return invoice_number
-        
+
         # Normalize to remove accents, preserving case
         deaccented = ''.join(c for c in unicodedata.normalize('NFKD', invoice_number) if not unicodedata.combining(c))
-        
+
         # Remove all non-alphanumeric characters
         sanitized = re.sub(r'[^a-zA-Z0-9]', '', deaccented)
-        
+
         return sanitized.replace('\\', '')
+
+    def _generate_offline_filename(self, pdf_path: Path) -> Tuple[str, Dict]:
+        """Create a safe fallback filename when running without AI analysis."""
+        stem = pdf_path.stem.strip()
+        if not stem:
+            stem = "document"
+
+        sanitized_stem = re.sub(r'[^A-Za-z0-9]+', '-', stem).strip('-')
+        if not sanitized_stem:
+            sanitized_stem = "document"
+
+        timestamp = datetime.now().strftime('%Y%m%d')
+        new_filename = f"{sanitized_stem}-OFFLINE-{timestamp}.pdf"
+
+        extracted_data = {
+            'mode': 'offline',
+            'original_stem': pdf_path.stem,
+            'generated_filename': new_filename,
+            'reason': 'Gemini analysis unavailable; generated fallback filename'
+        }
+
+        return new_filename, extracted_data
     
     def _format_date(self, date_str: str) -> str:
         """Format date from DD/MM/YYYY to MMYYYY."""
@@ -1291,7 +1555,12 @@ class PDFRenamer:
     def generate_new_filename(self, pdf_path: Path) -> Optional[str]:
         """Generate new filename for a PDF based on its content."""
         logger.info(f"Processing: {pdf_path}")
-        
+
+        if self.offline_mode:
+            new_filename, _ = self._generate_offline_filename(pdf_path)
+            logger.info(f"Offline mode generated filename: {new_filename}")
+            return new_filename
+
         # Analyze with Gemini
         analysis = self._analyze_invoice_with_gemini(pdf_path, pdf_path.name)
         if not analysis:
@@ -1306,7 +1575,6 @@ class PDFRenamer:
         invoice_date = analysis.get('invoice_date', '')
         invoice_number = analysis.get('invoice_number', '')
         restaurant_address = analysis.get('restaurant_address', '')
-        
         if not all([entreprise, invoice_provider, invoice_date, invoice_number]):
             logger.error(f"Missing required information for {pdf_path}")
             logger.error(f"entreprise: {entreprise}, provider: {invoice_provider}, date: {invoice_date}, number: {invoice_number}")
@@ -1345,6 +1613,9 @@ class PDFRenamer:
     
     def generate_new_filename_with_details(self, pdf_path: Path) -> Tuple[Optional[str], Dict]:
         """Generate new filename for a PDF and return detailed extraction data."""
+        if self.offline_mode:
+            return self._generate_offline_filename(pdf_path)
+
         # Analyze with Gemini (includes both image and text extraction fallbacks)
         analysis = self._analyze_invoice_with_gemini(pdf_path, pdf_path.name)
         if not analysis:
@@ -1382,7 +1653,7 @@ class PDFRenamer:
             'invoice_date': invoice_date,
             'invoice_number': invoice_number,
             'restaurant_address': restaurant_address,
-            'raw_analysis': analysis
+            'raw_analysis': analysis,
         }
 
         # Handle ABCDE, REFOOD, and VEOLIA special cases
@@ -1481,10 +1752,21 @@ class PDFRenamer:
             
             try:
                 new_filename, extracted_data = self.generate_new_filename_with_details(pdf_file)
-                
+
+                try:
+                    tracking_entry = self._prepare_tracking_entry(extracted_data)
+                    append_invoice_to_excel(
+                        self.suivi_excel_path,
+                        tracking_entry['site'],
+                        tracking_entry['prestataire'],
+                        tracking_entry['invoice_number'],
+                    )
+                except Exception as tracking_error:
+                    logger.error(f"Failed to update tracking Excel for {pdf_file.name}: {tracking_error}")
+
                 if new_filename:
                     new_path = pdf_file.parent / new_filename
-                    
+
                     if new_path.exists():
                         reason = f"Target file already exists: {new_filename}"
                         self.processing_logger.log_file_skipped(pdf_file.name, reason)
@@ -1665,6 +1947,7 @@ def main():
     parser.add_argument('--weekly-summary', action='store_true', help='Show weekly API usage summary and exit')
     parser.add_argument('--reset-counter', action='store_true', help='Reset today\'s API request counter (use with caution)')
     parser.add_argument('--disable-detailed-logging', action='store_true', help='Disable detailed log files (console only)')
+    parser.add_argument('--offline', action='store_true', help='Run without Gemini API (fallback filename generation)')
     
     args = parser.parse_args()
     
@@ -1672,7 +1955,7 @@ def main():
     if args.status or args.weekly_summary or args.reset_counter:
         try:
             enable_detailed_logging = not args.disable_detailed_logging
-            renamer = PDFRenamer(args.api_key, args.csv_dir, enable_detailed_logging)
+            renamer = PDFRenamer(args.api_key, args.csv_dir, enable_detailed_logging, offline_mode=args.offline)
             
             if args.status:
                 status = renamer.get_rate_limit_status()
@@ -1716,7 +1999,7 @@ def main():
     # If just checking status
     if args.status:
         try:
-            renamer = PDFRenamer(args.api_key, args.csv_dir)
+            renamer = PDFRenamer(args.api_key, args.csv_dir, offline_mode=args.offline)
             status = renamer.get_rate_limit_status()
             print(f"Rate Limit Status:")
             print(f"  Today: {status['requests_today']}/{status['max_per_day']} ({status['remaining_today']} remaining)")
@@ -1738,21 +2021,29 @@ def main():
         logger.error(f"CSV directory does not exist: {csv_dir}")
         return
     
-    # Check for required CSV files
-    required_files = ['Liste des clients.xlsx', 'Prestataires.csv']
-    for file in required_files:
-        if not (csv_dir / file).exists():
-            logger.error(f"Required CSV file not found: {csv_dir / file}")
-            return
+    offline_context = args.offline or genai is None
+
+    # Check for required CSV files unless operating offline
+    if offline_context:
+        logger.info("Offline mode active or Gemini SDK unavailable; skipping reference file validation.")
+    else:
+        required_files = ['Liste des clients.xlsx', 'Prestataires.csv']
+        for file in required_files:
+            if not (csv_dir / file).exists():
+                logger.error(f"Required CSV file not found: {csv_dir / file}")
+                return
     
     # Initialize renamer
     try:
         enable_detailed_logging = not args.disable_detailed_logging
-        renamer = PDFRenamer(args.api_key, csv_dir, enable_detailed_logging)
-        
+        renamer = PDFRenamer(args.api_key, csv_dir, enable_detailed_logging, offline_mode=args.offline)
+
         # Show initial rate limit status
         status = renamer.get_rate_limit_status()
-        logger.info(f"Starting with {status['remaining_today']} API requests remaining today")
+        if renamer.offline_mode:
+            logger.info("Offline mode active: API request limits are not enforced.")
+        else:
+            logger.info(f"Starting with {status['remaining_today']} API requests remaining today")
         
     except Exception as e:
         logger.error(f"Failed to initialize PDF renamer: {e}")
@@ -1762,7 +2053,7 @@ def main():
     pdf_files = list(pdf_dir.glob('*.pdf'))
     total_pdfs = len(pdf_files)
     
-    if total_pdfs > status['remaining_today']:
+    if not renamer.offline_mode and total_pdfs > status['remaining_today']:
         logger.warning(f"Found {total_pdfs} PDFs but only {status['remaining_today']} API requests remaining today")
         response = input(f"Continue with processing the first {status['remaining_today']} files? (y/n): ")
         if response.lower() != 'y':
@@ -1785,8 +2076,12 @@ def main():
     print(f"Successfully processed: {len(results['success'])}")
     print(f"Failed: {len(results['failed'])}")
     print(f"Skipped: {len(results['skipped'])}")
-    print(f"API requests used: {final_status['requests_today']}")
-    print(f"Remaining today: {final_status['remaining_today']}")
+    if renamer.offline_mode:
+        print("API requests used: 0 (offline mode)")
+        print("Remaining today: unlimited (offline mode)")
+    else:
+        print(f"API requests used: {final_status['requests_today']}")
+        print(f"Remaining today: {final_status['remaining_today']}")
     
     if results['failed']:
         print("\nFAILED FILES:")
@@ -1801,7 +2096,7 @@ def main():
     if args.dry_run:
         print("\nNote: This was a dry run. No files were actually renamed.")
     
-    if final_status['remaining_today'] <= 10:
+    if not renamer.offline_mode and final_status['remaining_today'] <= 10:
         print(f"\n⚠️  Warning: Only {final_status['remaining_today']} API requests remaining today!")
     
     # Log session end - Note: session end is already logged in rename_pdfs_in_directory()
