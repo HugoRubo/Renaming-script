@@ -58,8 +58,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DEFAULT_SUIVI_PATH = Path(__file__).resolve().parent / "Suivi_factures.xlsx"
+DEFAULT_SUIVI_PATH = Path(r"C:\Users\HugoCHASTENET\JICAP\Drive - 10.RUBO\MCDONALD'S_ Gestion Déléguée\03_RUN\Facturation\Facturation ALL\SUIVI DES FACTURES.xlsx")
 EXCEL_HEADERS = ["Site", "Prestataire", "Numéro de facture", "Date d'insertion"]
+SUIVI_SHEET_NAME = "FACTURES RENOMMEES"
 
 
 def _first_non_empty(*values) -> Optional[str]:
@@ -92,16 +93,16 @@ def append_invoice_to_excel(file_path, site, prestataire, invoice_number):
 
     if suivi_path.exists():
         workbook = load_workbook(suivi_path)
-        if "Suivi" in workbook.sheetnames:
-            worksheet = workbook["Suivi"]
+        if SUIVI_SHEET_NAME in workbook.sheetnames:
+            worksheet = workbook[SUIVI_SHEET_NAME]
         else:
-            worksheet = workbook.create_sheet("Suivi")
+            worksheet = workbook.create_sheet(SUIVI_SHEET_NAME)
             if worksheet.max_row == 1 and all(cell.value is None for cell in worksheet[1]):
                 worksheet.append(EXCEL_HEADERS)
     else:
         workbook = Workbook()
         worksheet = workbook.active
-        worksheet.title = "Suivi"
+        worksheet.title = SUIVI_SHEET_NAME
         worksheet.append(EXCEL_HEADERS)
 
     # Prepare deduplication keys
@@ -955,38 +956,6 @@ class PDFRenamer:
             logger.debug(f"Unable to read metadata for {pdf_path}: {e}")
             return {}
 
-    def _extract_amounts_from_metadata(self, metadata: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
-        """Extract montant HT and TTC from metadata if present."""
-        montant_ht = None
-        montant_ttc = None
-
-        for key, value in metadata.items():
-            lower_key = key.lower()
-            if montant_ht is None and 'ht' in lower_key:
-                montant_ht = value
-            if montant_ttc is None and 'ttc' in lower_key:
-                montant_ttc = value
-
-        return montant_ht, montant_ttc
-
-    def _search_amount_in_text(self, text: str, keywords: List[str]) -> Optional[str]:
-        """Search for an amount near given keywords within the text."""
-        if not text:
-            return None
-
-        for keyword in keywords:
-            pattern = re.compile(rf"{keyword}[^0-9]*([\d\s.,]+)", re.IGNORECASE)
-            match = pattern.search(text)
-            if match:
-                return match.group(1)
-        return None
-
-    def _extract_amounts_from_text(self, text: str) -> Tuple[Optional[str], Optional[str]]:
-        """Extract HT and TTC amounts from text content."""
-        montant_ht = self._search_amount_in_text(text, ['montant\s*ht', 'total\s*ht', 'ht\s*:\s*'])
-        montant_ttc = self._search_amount_in_text(text, ['montant\s*ttc', 'total\s*ttc', 'ttc\s*:\s*'])
-        return montant_ht, montant_ttc
-
     def _extract_site_from_filename(self, filename: str) -> Optional[str]:
         """Try to extract the site number from a filename."""
         if not filename:
@@ -1025,17 +994,6 @@ class PDFRenamer:
             candidate = parts[-1].strip()
             if candidate:
                 return candidate
-        return None
-
-    def _extract_amount_from_filename(self, filename: str, label: str) -> Optional[str]:
-        """Extract an amount labelled with HT or TTC inside the filename."""
-        if not filename:
-            return None
-
-        pattern = re.compile(rf"{label}[^0-9]*([\d.,]+)", re.IGNORECASE)
-        match = pattern.search(filename)
-        if match:
-            return match.group(1)
         return None
 
     def _prepare_tracking_entry(self, extracted_data: Dict) -> Dict[str, Optional[str]]:
@@ -1078,15 +1036,13 @@ class PDFRenamer:
 
         prompt = """
         Analyze this French invoice PDF and extract the following information in JSON format:
-        
+
         1. entreprise: The company name. Be very specific and extract the full name. For example, if the name is "McDonald's Chalon Sur Saone Bowling", extract the entire name, not just "McDonald's Chalon". Look for variations of McDonald's like "MAC DO", "McDONALD'S", etc.
         2. restaurant_address: The restaurant address if mentioned (street address, city, postal code)
         3. invoice_provider: The invoice provider/collector company (like SUEZ, VEOLIA, PAPREC, etc.)
         4. invoice_date: The relevant date for filename in DD/MM/YYYY format (see critical note below)
         5. invoice_number: The invoice number (usually alphanumeric)
         6. site_number: The site number (e.g., 620). ONLY extract this if the invoice_provider is "ABCDE", "REFOOD", or "VEOLIA". For all other providers, this should be null.
-        7. montant_ht: The net amount (hors taxes) as shown on the invoice. Keep the numeric value with decimals.
-        8. montant_ttc: The gross amount (toutes taxes comprises) as shown on the invoice. Keep the numeric value with decimals.
         
         Important notes:
         - For "ABCDE" invoices, the site number is in a format like "Mcdonald's n°620". Extract 620.
@@ -1129,8 +1085,6 @@ class PDFRenamer:
                 4. invoice_date: The relevant date for filename in DD/MM/YYYY format (see critical note below)
                 5. invoice_number: The invoice number (usually alphanumeric)
                 6. site_number: The site number (e.g., 620). ONLY extract this if the invoice_provider is "ABCDE", "REFOOD", or "VEOLIA". For all other providers, this should be null.
-                7. montant_ht: The net amount (hors taxes) as shown on the invoice. Keep the numeric value with decimals.
-                8. montant_ttc: The gross amount (toutes taxes comprises) as shown on the invoice. Keep the numeric value with decimals.
                 
                 Important notes:
                 - For "ABCDE" invoices, the site number is in a format like "Mcdonald's n°620". Extract 620.
@@ -1621,9 +1575,6 @@ class PDFRenamer:
         invoice_date = analysis.get('invoice_date', '')
         invoice_number = analysis.get('invoice_number', '')
         restaurant_address = analysis.get('restaurant_address', '')
-        montant_ht = analysis.get('montant_ht') or analysis.get('amount_ht')
-        montant_ttc = analysis.get('montant_ttc') or analysis.get('amount_ttc')
-        
         if not all([entreprise, invoice_provider, invoice_date, invoice_number]):
             logger.error(f"Missing required information for {pdf_path}")
             logger.error(f"entreprise: {entreprise}, provider: {invoice_provider}, date: {invoice_date}, number: {invoice_number}")
@@ -1703,8 +1654,6 @@ class PDFRenamer:
             'invoice_number': invoice_number,
             'restaurant_address': restaurant_address,
             'raw_analysis': analysis,
-            'montant_ht': montant_ht,
-            'montant_ttc': montant_ttc
         }
 
         # Handle ABCDE, REFOOD, and VEOLIA special cases
